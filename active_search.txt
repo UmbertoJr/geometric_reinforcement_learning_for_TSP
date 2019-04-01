@@ -1,0 +1,146 @@
+import tensorflow as tf
+from tqdm import tqdm
+import numpy as np
+from time import time as t
+import os
+import argparse
+from actor_critic import Actor
+
+from dataGenerator import DataGenerator
+
+dataset = DataGenerator()
+
+
+parser = argparse.ArgumentParser(description='Configuration file to train the model')
+arg_lists = []
+
+def add_argument_group(name):
+    arg = parser.add_argument_group(name)
+    arg_lists.append(arg)
+    return arg
+
+def str2bool(v):
+    return v.lower() in ('true', '1')
+
+
+################################################### DA MODIFICARE ###############################################
+# Data
+data_arg = add_argument_group('Data')
+data_arg.add_argument('--batch_size', type=int, default=256, help='batch size')
+data_arg.add_argument('--graph_dimension', type=int, default=50, help='number of cities') ##### #####
+data_arg.add_argument('--dimension', type=int, default=2, help='city dimension')
+
+# Network
+net_arg = add_argument_group('Network')
+net_arg.add_argument('--input_embed', type=int, default=128, help='actor critic input embedding')
+net_arg.add_argument('--num_neurons', type=int, default=512, help='encoder inner layer neurons')
+net_arg.add_argument('--num_stacks', type=int, default=5, help='encoder num stacks')
+net_arg.add_argument('--num_heads', type=int, default=16, help='encoder num heads')
+net_arg.add_argument('--query_dim', type=int, default=360, help='decoder query space dimension')
+net_arg.add_argument('--num_units', type=int, default=256, help='decoder and critic attention product space')
+net_arg.add_argument('--num_neurons_critic', type=int, default=256, help='critic n-1 layer')
+
+# Train / test parameters
+train_arg = add_argument_group('Training')
+train_arg.add_argument('--nb_steps', type=int, default=40000, help='nb steps')
+train_arg.add_argument('--init_B', type=float, default=7., help='critic init baseline')
+train_arg.add_argument('--lr_start', type=float, default=0.001, help='actor learning rate')
+train_arg.add_argument('--lr_decay_step', type=int, default=5000, help='lr1 decay step')
+train_arg.add_argument('--lr_decay_rate', type=float, default=0.96, help='lr1 decay rate')
+train_arg.add_argument('--temperature', type=float, default=1.0, help='pointer initial temperature')
+train_arg.add_argument('--C', type=float, default=10.0, help='pointer tanh clipping')
+train_arg.add_argument('--is_training', type=str2bool, default=True, help='switch to inference mode when model is trained') 
+
+parser.parse_args()
+
+def get_config():
+    config, unparsed = parser.parse_known_args()
+    return config, unparsed
+
+
+
+config, _ = get_config()
+dir_ = str(config.dimension)+'D_'+'TSP'+str(config.graph_dimension) +'_b'+str(config.batch_size)+'_e'+str(config.input_embed)+'_n'+str(config.num_neurons)+'_s'+str(config.num_stacks)+'_h'+str(config.num_heads)+ '_q'+str(config.query_dim) +'_u'+str(config.num_units)+'_c'+str(config.num_neurons_critic)+ '_lr'+str(config.lr_start)+'_d'+str(config.lr_decay_step)+'_'+str(config.lr_decay_rate)+ '_T'+str(config.temperature)+ '_steps'+str(config.nb_steps)+'_i'+str(config.init_B) 
+print(dir_)
+
+
+######################################          TEST    #################################
+
+
+config.is_training = False
+config.batch_size = 10000 ##### #####
+#config.max_length = 50 ##### #####
+config.temperature = 1.2 ##### #####
+
+tf.reset_default_graph()
+actor = Actor(config) # Build graph
+
+variables_to_save = [v for v in tf.global_variables() if 'Adam' not in v.name] # Save & restore all the variables.
+saver = tf.train.Saver(var_list=variables_to_save, keep_checkpoint_every_n_hours=1.0)   
+
+
+with tf.Session() as sess:  # start session
+    sess.run(tf.global_variables_initializer()) # Run initialize op
+    
+    save_path = "save/"+dir_
+    saver.restore(sess, save_path+"/actor.ckpt") # Restore variables from disk.
+    
+    predictions_length, predictions_length_w2opt, time_mmodel, time_l2opt = [], [], [], []
+    pred_all_2opt, time_all_2opt = [], []
+    for i in tqdm(range(1000)): # test instance
+        seed_ = 1+i
+        input_batch, dist_batch = dataset.test_batch(1, actor.max_length, actor.dimension, seed=seed_)
+        feed = {actor.input_: input_batch,  actor.distances: dist_batch} # Get feed dict
+        start = t()
+        tour, reward = sess.run([actor.from_, actor.reward], feed_dict=feed) # sample tours
+        model_time = (t() - start)
+        time_mmodel.append(model_time)
+        j = np.argmin(reward) # find best solution
+        best_permutation = tour[j]
+        predictions_length.append(reward[j])
+        #print('reward (before 2 opt)',reward[j])
+        #dataset.visualize_2D_trip(input_batch[0][best_permutation])
+        #dataset.visualize_sampling(tour)
+        
+        start2 = t()
+        opt_tour, opt_length = dataset.loop2opt(best_permutation, dist_batch[0])
+        l2opt_time = t()- start + model_time
+        time_l2opt.append(l2opt_time)
+        predictions_length_w2opt.append(opt_length)
+
+        min_actual = opt_length
+        start3 = t()
+        for it in tour[np.argsort(reward)][:50]:
+            opt_tour_all, opt_length_all = dataset.loop2opt(it, dist_batch[0])
+            if opt_length_all < min_actual:
+                min_actual = opt_length_all
+        pred_all_2opt.append(min_actual); time_all_2opt.append(t()-start3 + model_time)
+
+
+        #print('reward (with 2 opt)', opt_length)
+        #dataset.visualize_2D_trip(input_batch[0][opt_tour])
+        
+    predictions_length = np.asarray(predictions_length) # average tour length
+    time_mean_model = np.mean(time_mmodel)
+    predictions_length_w2opt = np.asarray(predictions_length_w2opt)
+    time_mean_after = np.mean(time_l2opt)
+    print("Testing COMPLETED !")
+    print( "Mean length model :",np.mean(predictions_length)," in time : ",time_mean_model , "\nMean length 2opt:",np.mean(predictions_length_w2opt), "in time ", time_mean_after)
+    pred_len_all_2opt = np.asarray(pred_all_2opt)
+    print("Mean len all 2opt", np.mean(pred_len_all_2opt), "in time : ", np.mean(time_all_2opt))
+
+    
+import matplotlib.pyplot as plt
+
+n1, bins1, patches1 = plt.hist(predictions_length, 50, facecolor='b', alpha=0.75) # Histogram
+n2, bins2, patches2 = plt.hist(predictions_length_w2opt, 50, facecolor='g', alpha=0.75) # Histogram
+n3, bins3, patches3 = plt.hist(pred_len_all_2opt, 50, facecolor='y', alpha=0.75) # Histogram
+plt.xlabel('Tour length')
+plt.xlabel('Tour length')
+plt.ylabel('Counts')
+plt.axis([3., 9., 0, 250])
+plt.grid(True)
+plt.show()
+
+    
+
